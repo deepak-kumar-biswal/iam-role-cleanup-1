@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Part 1 (Identification) using Access Analyzer feed from S3
+
+Parameters:
+  TargetAccountIds:
+    Type: CommaDelimitedList
+  ExecutionRoleName:
+    Type: String
+    Default: IAMCleanupExecutionRole
+  FeedBucket:
+    Type: String
+    Description: S3 bucket where Access Analyzer feed lives
+  FeedPrefix:
+    Type: String
+    Description: S3 prefix (folder) that contains the feed
+  LambdaCodeBucket:
+    Type: String
+  InventoryCollectorKey:
+    Type: String
+  UsageCheckerKey:
+    Type: String
+  WriterKey:
+    Type: String
+  NotifierKey:
+    Type: String
+  ReportPrefix:
+    Type: String
+    Default: iam-cleanup/identification/
+  SlackWebhookSSMParam:
+    Type: String
+    Default: /iam-cleanup/slack-webhook
+
+Resources:
+  TableIamStackRoleUsage:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub IamStackRoleUsage-${AWS::StackName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: Pk,    AttributeType: S }
+        - { AttributeName: Sk,    AttributeType: S }
+        - { AttributeName: Gsi1Pk, AttributeType: S }
+        - { AttributeName: Gsi1Sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: Pk, KeyType: HASH }
+        - { AttributeName: Sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: Gsi1Pk, KeyType: HASH }
+            - { AttributeName: Gsi1Sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub iam-cleanup-ident-lambda-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub arn:aws:iam::*:role/${ExecutionRoleName}
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                Resource: !GetAtt TableIamStackRoleUsage.Arn
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub ${TableIamStackRoleUsage.Arn}/index/GSI1
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${FeedBucket}
+                  - !Sub arn:aws:s3:::${FeedBucket}/${FeedPrefix}*
+
+  InventoryCollector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub iam-ident-inventory-${AWS::StackName}
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 512
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref InventoryCollectorKey }
+      Environment:
+        Variables:
+          EXECUTION_ROLE_NAME: !Ref ExecutionRoleName
+          REPORT_PREFIX: !Ref ReportPrefix
+          TABLE_NAME: !Ref TableIamStackRoleUsage
+
+  UsageChecker:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub iam-ident-usage-${AWS::StackName}
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 512
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref UsageCheckerKey }
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableIamStackRoleUsage
+          FEED_BUCKET: !Ref FeedBucket
+          FEED_PREFIX: !Ref FeedPrefix
+
+  Writer:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub iam-ident-writer-${AWS::StackName}
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 512
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref WriterKey }
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableIamStackRoleUsage
+
+  Notifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub iam-ident-notifier-${AWS::StackName}
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 128
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref NotifierKey }
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_PARAM: !Ref SlackWebhookSSMParam
+
+  SfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub iam-ident-sfn-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ lambda:InvokeFunction ]
+                Resource:
+                  - !GetAtt InventoryCollector.Arn
+                  - !GetAtt UsageChecker.Arn
+                  - !GetAtt Writer.Arn
+                  - !GetAtt Notifier.Arn
+
+  Orchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub iam-ident-orchestrator-${AWS::StackName}
+      RoleArn: !GetAtt SfnRole.Arn
+      DefinitionString:
+        !Sub |
+          {{
+            "Comment": "Part 1 identification pipeline (Access Analyzer feed)",
+            "StartAt": "Inventory",
+            "States": {{
+              "Inventory": {{
+                "Type": "Task",
+                "Resource": "${{InventoryCollector.Arn}}",
+                "ResultPath": "$.inventory",
+                "Next": "UsageCheck"
+              }},
+              "UsageCheck": {{
+                "Type": "Task",
+                "Resource": "${{UsageChecker.Arn}}",
+                "ResultPath": "$.usage",
+                "Next": "WriteSummaries"
+              }},
+              "WriteSummaries": {{
+                "Type": "Task",
+                "Resource": "${{Writer.Arn}}",
+                "ResultPath": "$.written",
+                "Next": "Notify"
+              }},
+              "Notify": {{
+                "Type": "Task",
+                "Resource": "${{Notifier.Arn}}",
+                "End": true
+              }}
+            }}
+          }}
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref Orchestrator
+  TableName:
+    Value: !Ref TableIamStackRoleUsage

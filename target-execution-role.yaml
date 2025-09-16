@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cross-account execution role for IAM cleanup identification (Part 1)
+
+Parameters:
+  OrchestratorAccountId:
+    Type: String
+  RoleName:
+    Type: String
+    Default: IAMCleanupExecutionRole
+
+Resources:
+  ExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${OrchestratorAccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IAMCleanupDiscovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:List*
+                  - iam:Get*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:ListStacks
+                  - cloudformation:ListStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:GetFunction
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - events:ListRules
+                  - events:DescribeRule
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecs:List*
+                  - ecs:Describe*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - codebuild:ListProjects
+                  - codebuild:BatchGetProjects
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - codepipeline:ListPipelines
+                  - codepipeline:GetPipeline
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - glue:GetJobs
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:ListStateMachines
+                  - states:DescribeStateMachine
+                Resource: "*"
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt ExecRole.Arn
